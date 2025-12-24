@@ -28,7 +28,21 @@ public class FearServerMonitor {
 
     private static List<FearServerListFetcher.FearServer> serverList = new ArrayList<>();
 
-    private static final Map<String, Long> sentMessages = new ConcurrentHashMap<>();
+    private static class ServerMessageInfo {
+        long messageId;
+        String lastContent;
+        String lastMap;
+        int lastPlayerCount;
+
+        ServerMessageInfo(long messageId, String lastContent, String lastMap, int lastPlayerCount) {
+            this.messageId = messageId;
+            this.lastContent = lastContent;
+            this.lastMap = lastMap;
+            this.lastPlayerCount = lastPlayerCount;
+        }
+    }
+
+    private static final Map<String, ServerMessageInfo> serverMessages = new ConcurrentHashMap<>();
 
     private static JDA jda;
     private static TextChannel targetChannel;
@@ -52,7 +66,6 @@ public class FearServerMonitor {
             }
 
             loadServerList();
-
             scheduleTasks();
 
         } catch (Exception e) {
@@ -70,8 +83,8 @@ public class FearServerMonitor {
             props.setProperty("token", "YOUR_BOT_TOKEN_HERE");
             props.setProperty("channel_id", "YOUR_CHANNEL_ID_HERE");
             props.setProperty("list_check_interval", "24"); // hours
-            props.setProperty("servers_check_interval", "3"); // minutes
-            props.setProperty("player_threshold", "2");
+            props.setProperty("servers_check_interval", "2"); // minutes
+            props.setProperty("player_threshold", "3");
 
             try (FileOutputStream out = new FileOutputStream(CONFIG_FILE)) {
                 props.store(out, "Configuration for Fear Server Monitor Bot");
@@ -119,8 +132,7 @@ public class FearServerMonitor {
             boolean success = FearServerListFetcher.fetchAndSaveServerList();
             if (success) {
                 loadServerList();
-                sentMessages.clear();
-                System.out.println("Server list updated.");
+                System.out.println("Server list updated. Loaded " + serverList.size() + " servers.");
 
             } else {
                 System.err.println("Failed to update the server list.");
@@ -146,7 +158,7 @@ public class FearServerMonitor {
             } catch (Exception e) {
                 System.err.println("Error in scheduled task for checking servers: " + e.getMessage());
             }
-        }, 0, serversCheckInterval, TimeUnit.MINUTES);
+        }, 1, serversCheckInterval, TimeUnit.MINUTES);
 
         System.out.println("Scheduled tasks:");
         System.out.println("- Update server list every " + listCheckInterval + " hours");
@@ -160,42 +172,68 @@ public class FearServerMonitor {
         }
 
         System.out.println("Checking " + serverList.size() + " servers...");
+
         int activeServers = 0;
+        int serversWithPlayers = 0;
 
         for (FearServerListFetcher.FearServer server : serverList) {
             try {
                 FearQuery.ServerStatus status = FearQuery.query(server.getIp(), server.getPort(), 5000);
                 String serverKey = server.getIp() + ":" + server.getPort();
-                Long messageId = sentMessages.get(serverKey);
-
-                if (status.online && status.currentPlayers >= playerThreshold) {
-                    System.out.println("Server " + server.getName() + " has " + status.currentPlayers + " players!");
-
-                    String messageContent = createServerMessage(server, status);
-
-                    if (messageId == null) {
-                        sendNewMessage(serverKey, messageContent);
-                    } else {
-                        updateExistingMessage(serverKey, messageId, messageContent);
-                    }
-                } else if (messageId != null) {
-                    deleteMessage(serverKey, messageId);
-                }
 
                 if (status.online) {
                     activeServers++;
+                    System.out.println("Server ONLINE: " + server.getName() + " (" + server.getIp() + ":" + server.getPort() +
+                            ") Players: " + status.currentPlayers + "/" + status.maxPlayers +
+                            " Map: " + status.map);
+
+                    if (status.currentPlayers >= playerThreshold) {
+                        serversWithPlayers++;
+                        System.out.println("  -> Sufficient number of players (" + status.currentPlayers + " >= " + playerThreshold + ")");
+
+                        ServerMessageInfo messageInfo = serverMessages.get(serverKey);
+
+                        if (messageInfo == null) {
+                            sendNewMessage(serverKey, server, status);
+                        } else {
+                            boolean needsUpdate = !status.map.equals(messageInfo.lastMap) ||
+                                    status.currentPlayers != messageInfo.lastPlayerCount;
+
+                            if (needsUpdate) {
+                                System.out.println("  -> Needs updating (map or number of players has changed)");
+                                updateExistingMessage(serverKey, messageInfo, server, status);
+                            } else {
+                                System.out.println("  -> No update required");
+                            }
+                        }
+                    } else {
+                        ServerMessageInfo messageInfo = serverMessages.get(serverKey);
+                        if (messageInfo != null) {
+                            System.out.println("  -> Not enough players (" + status.currentPlayers + " < " + playerThreshold + "), deleting the message");
+                            deleteMessage(serverKey, messageInfo.messageId);
+                        }
+                    }
+                } else {
+                    ServerMessageInfo messageInfo = serverMessages.get(serverKey);
+                    if (messageInfo != null) {
+                        System.out.println("Server OFFLINE: " + server.getName() + " - deleting the message");
+                        deleteMessage(serverKey, messageInfo.messageId);
+                    } else {
+                        System.out.println("Server OFFLINE: " + server.getName());
+                    }
                 }
 
                 Thread.sleep(100);
 
             } catch (Exception e) {
                 System.err.println("Error while checking the server " + server.getIp() + ":" +
-                        server.getPort() + ": " + e.getMessage());
+                        server.getPort() + " (" + server.getName() + "): " + e.getMessage());
 
                 String serverKey = server.getIp() + ":" + server.getPort();
-                Long messageId = sentMessages.get(serverKey);
-                if (messageId != null) {
-                    deleteMessage(serverKey, messageId);
+                ServerMessageInfo messageInfo = serverMessages.get(serverKey);
+                if (messageInfo != null) {
+                    System.out.println("  -> Error while pinging, deleting message");
+                    deleteMessage(serverKey, messageInfo.messageId);
                 }
             }
         }
@@ -222,61 +260,78 @@ public class FearServerMonitor {
         );
     }
 
-    private static void sendNewMessage(String serverKey, String messageContent) {
+    private static void sendNewMessage(String serverKey, FearServerListFetcher.FearServer server, FearQuery.ServerStatus status) {
         if (targetChannel == null) return;
+
+        String messageContent = createServerMessage(server, status);
 
         targetChannel.sendMessage(messageContent).queue(
                 message -> {
-                    sentMessages.put(serverKey, message.getIdLong());
-                    System.out.println("A new message has been sent for the server: " + serverKey);
+                    ServerMessageInfo info = new ServerMessageInfo(
+                            message.getIdLong(),
+                            messageContent,
+                            status.map,
+                            status.currentPlayers
+                    );
+                    serverMessages.put(serverKey, info);
+                    System.out.println("  -> A new message has been sent (ID: " + message.getIdLong() + ")");
                 },
                 error -> {
-                    System.err.println("Error sending new message for " + serverKey + ": " + error.getMessage());
+                    System.err.println("  -> Error sending new message: " + error.getMessage());
                 }
         );
     }
 
-    private static void updateExistingMessage(String serverKey, Long messageId, String newContent) {
+    private static void updateExistingMessage(String serverKey, ServerMessageInfo messageInfo,
+                                              FearServerListFetcher.FearServer server, FearQuery.ServerStatus status) {
         if (targetChannel == null) return;
 
-        targetChannel.retrieveMessageById(messageId).queue(
+        String newContent = createServerMessage(server, status);
+
+        targetChannel.retrieveMessageById(messageInfo.messageId).queue(
                 message -> {
-                    if (!message.getContentRaw().equals(newContent)) {
-                        message.editMessage(newContent).queue(
-                                success -> System.out.println("Message updated for server: " + serverKey),
-                                error -> System.err.println("Error updating messages for " + serverKey + ": " + error.getMessage())
-                        );
-                    } else {
-                        System.out.println("Message for the server " + serverKey + " does not require updating");
-                    }
+                    message.editMessage(newContent).queue(
+                            success -> {
+                                messageInfo.lastContent = newContent;
+                                messageInfo.lastMap = status.map;
+                                messageInfo.lastPlayerCount = status.currentPlayers;
+                                serverMessages.put(serverKey, messageInfo);
+                                System.out.println("  -> Message updated (ID: " + messageInfo.messageId + ")");
+                            },
+                            error -> {
+                                System.err.println("  -> Error updating message: " + error.getMessage());
+                                serverMessages.remove(serverKey);
+                                sendNewMessage(serverKey, server, status);
+                            }
+                    );
                 },
                 error -> {
-                    System.err.println("No messages found " + messageId + " for the server " + serverKey + ", deleting from memory");
-                    sentMessages.remove(serverKey);
-                    sendNewMessage(serverKey, newContent);
+                    System.err.println("  -> No messages found ID: " + messageInfo.messageId + ", deleting from memory");
+                    serverMessages.remove(serverKey);
+                    sendNewMessage(serverKey, server, status);
                 }
         );
     }
 
-    private static void deleteMessage(String serverKey, Long messageId) {
+    private static void deleteMessage(String serverKey, long messageId) {
         if (targetChannel == null) return;
 
         targetChannel.retrieveMessageById(messageId).queue(
                 message -> {
                     message.delete().queue(
                             success -> {
-                                sentMessages.remove(serverKey);
-                                System.out.println("The messagehas been deleted for the server: " + serverKey);
+                                serverMessages.remove(serverKey);
+                                System.out.println("  -> Message has been deleted (ID: " + messageId + ")");
                             },
                             error -> {
-                                System.err.println("Error while deleting messages for " + serverKey + ": " + error.getMessage());
-                                sentMessages.remove(serverKey);
+                                System.err.println("  -> Error while deleting message: " + error.getMessage());
+                                serverMessages.remove(serverKey);
                             }
                     );
                 },
                 error -> {
-                    System.err.println("No messages found to delete for " + serverKey);
-                    sentMessages.remove(serverKey);
+                    System.err.println("  -> No messages found to delete");
+                    serverMessages.remove(serverKey);
                 }
         );
     }
